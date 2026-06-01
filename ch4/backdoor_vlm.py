@@ -1,14 +1,21 @@
 """Real LoRA loading + VLM inference for backdoored adapters.
 
-Loads SmolVLM-500M-Instruct (the base, also known as `HuggingFaceTB/
-SmolVLM-500M-Instruct`) + a chosen PEFT/LoRA adapter from one of:
-  - qbtrain/bdoor-caption-500m
-  - qbtrain/bdoor-medical-500m
-  - qbtrain/bdoor-finance-500m
+Loads SmolVLM-500M-Instruct (HuggingFaceTB/SmolVLM-500M-Instruct) + a chosen
+PEFT/LoRA backdoor adapter from HF. Currently the only published adapter is
+`qbtrain/bdoor-caption-500m` (medical/finance variants are planned but
+not yet on HF).
 
 Provides a uniform `generate(prompt, image, ...)` API and per-call
-swap/unswap of the active adapter so cells can iterate between domain
-backdoors without paying the base-model reload cost.
+swap/unswap of the active adapter so cells can iterate between adapters
+without paying the base-model reload cost.
+
+Important: the published caption adapter was trained on a bare LlamaModel
+(SmolVLM's inner text decoder), so its safetensors keys use the path
+`base_model.model.layers.X.self_attn.X_proj...` rather than the wrapped
+path `base_model.model.text_model.layers.X...`. `attach_adapter()` below
+applies PEFT to `model.model.text_model` (the inner LlamaModel) instead
+of the wrapped Idefics3 model — without this, every weight is silently
+dropped at load time and the backdoor never activates.
 """
 from __future__ import annotations
 
@@ -108,6 +115,27 @@ def load_base(device: str = "auto", dtype: Optional[str] = None) -> LoadedBackdo
     return _CURRENT
 
 
+def _text_decoder(model):
+    """Locate the inner LlamaModel inside a wrapped Idefics3 (SmolVLM).
+
+    `qbtrain/bdoor-caption-500m` was trained on a bare LlamaModel and saved
+    with keys like `base_model.model.layers.X.self_attn.X_proj.lora_A.weight`.
+    Loading it onto the wrapped Idefics3 (where text layers live at
+    `model.text_model.layers.X.self_attn.X_proj`) silently drops every weight
+    because the key paths don't match. PEFT only warns about missing keys.
+
+    The fix is to apply PEFT to the inner text decoder. After replacing
+    `model.model.text_model` with the PeftModel-wrapped version, the rest of
+    the multimodal pipeline (vision encoder → connector → text decoder)
+    still works as normal.
+    """
+    if hasattr(model, "model") and hasattr(model.model, "text_model"):
+        return model.model.text_model  # Idefics3 (SmolVLM family)
+    if hasattr(model, "text_model"):
+        return model.text_model
+    return None
+
+
 def attach_adapter(short_id: str) -> LoadedBackdoorVLM:
     """Attach a backdoor LoRA adapter (downloads on first use, then caches).
 
@@ -121,29 +149,49 @@ def attach_adapter(short_id: str) -> LoadedBackdoorVLM:
 
     meta: BackdoorModel = get_backdoor_model(short_id)
 
-    # Lazy import: peft is required only when we attach an adapter
     from peft import PeftModel
 
     if short_id in vlm.loaded_adapters:
-        # Already loaded — just switch
+        # Already loaded — switch on the PeftModel wrapper, which lives at
+        # `vlm.model.model.text_model` after our first attach.
+        target = _text_decoder(vlm.model) or vlm.model
         try:
-            vlm.model.set_adapter(vlm.loaded_adapters[short_id])
+            target.set_adapter(vlm.loaded_adapters[short_id])
         except Exception:
             pass
         vlm.active_adapter = short_id
         return vlm
 
     adapter_name = f"bdoor_{short_id}"
-    if not vlm.loaded_adapters:
-        # First adapter: wrap the base model with PeftModel
-        vlm.model = PeftModel.from_pretrained(
-            vlm.model, meta.hf_repo, adapter_name=adapter_name,
-        )
+    text_dec = _text_decoder(vlm.model)
+    if text_dec is None:
+        # Fallback: try wrapping the whole model (works if adapter was trained
+        # against the wrapped architecture). This used to be the default and
+        # silently lost weights for SmolVLM-family adapters — kept only as a
+        # safety net for architectures we haven't accounted for.
+        if not vlm.loaded_adapters:
+            vlm.model = PeftModel.from_pretrained(
+                vlm.model, meta.hf_repo, adapter_name=adapter_name,
+            )
+        else:
+            vlm.model.load_adapter(meta.hf_repo, adapter_name=adapter_name)
+        target = vlm.model
     else:
-        # Subsequent: load_adapter on the existing PeftModel
-        vlm.model.load_adapter(meta.hf_repo, adapter_name=adapter_name)
+        # Apply PEFT to the inner text decoder, replace in place. The wrapped
+        # text_model still behaves identically for forward() / generate().
+        if not vlm.loaded_adapters:
+            wrapped = PeftModel.from_pretrained(
+                text_dec, meta.hf_repo, adapter_name=adapter_name,
+            )
+            vlm.model.model.text_model = wrapped
+            target = wrapped
+        else:
+            # Subsequent adapters: load_adapter on the existing wrapped decoder
+            target = vlm.model.model.text_model
+            target.load_adapter(meta.hf_repo, adapter_name=adapter_name)
+
     try:
-        vlm.model.set_adapter(adapter_name)
+        target.set_adapter(adapter_name)
     except Exception:
         pass
 
@@ -156,8 +204,9 @@ def detach_adapter() -> None:
     """Disable LoRA adapters and run with the base model only."""
     if _CURRENT is None or not _CURRENT.loaded_adapters:
         return
+    target = _text_decoder(_CURRENT.model) or _CURRENT.model
     try:
-        _CURRENT.model.disable_adapter_layers()
+        target.disable_adapter_layers()
     except Exception:
         pass
     _CURRENT.active_adapter = None
@@ -167,8 +216,9 @@ def enable_adapter() -> None:
     """Re-enable LoRA adapters after detach_adapter()."""
     if _CURRENT is None:
         return
+    target = _text_decoder(_CURRENT.model) or _CURRENT.model
     try:
-        _CURRENT.model.enable_adapter_layers()
+        target.enable_adapter_layers()
     except Exception:
         pass
 
