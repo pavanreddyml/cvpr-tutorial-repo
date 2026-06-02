@@ -33,8 +33,18 @@ def ensure_decoy(name: str, cache_dir: Path | str = DEFAULT_CACHE) -> Path:
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = resp.read()
     # Re-encode through PIL so the cached file is always PNG.
+    # Defensively raise PIL's MAX_IMAGE_PIXELS cap for the duration of this
+    # decode — Wikimedia's full-res scans (e.g. the Google Art Project copy
+    # of Starry Night at ~1.57 G pixels) otherwise trip DecompressionBombError
+    # before we get a chance to downsample. We always downsize to attack
+    # dimensions in `generate_anamorpher_image`, so a "big" source is fine.
     from io import BytesIO
-    img = Image.open(BytesIO(data)).convert("RGB")
+    prev_cap = Image.MAX_IMAGE_PIXELS
+    try:
+        Image.MAX_IMAGE_PIXELS = None  # disable bomb check inside this loader
+        img = Image.open(BytesIO(data)).convert("RGB")
+    finally:
+        Image.MAX_IMAGE_PIXELS = prev_cap
     img.save(out, format="PNG")
     return out
 

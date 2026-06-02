@@ -12,8 +12,7 @@ Two ways the target is built (controlled by `target_mode`):
   * "figstep" (default) — the entire target canvas is a Ch1-style FigStep
     image: BLACK background, WHITE text, instruction + empty 1./2./3.
     numbered items. The post-downscale image looks like a typographic
-    jailbreak. Use with `dc_preserving=False` for bilinear/bicubic so
-    the high-contrast text actually reaches its target values.
+    jailbreak.
   * "patch" — the legacy "small region inside the decoy" target. The
     decoy stays visible everywhere except the region; the region carries
     a small black-on-white text block.
@@ -28,12 +27,15 @@ pixels change, so the full-res cover is still visually recognizable
 (noisy, but the subject reads through). The downscale is a clean
 black/white FigStep image.
 
-For "figstep" + BILINEAR/BICUBIC: the DC-preserving solver caps amplitude
-at the decoy's per-block mean. For pure-black backgrounds against a bright
-decoy that collapses the text to dark gray on dark gray — readable to OCR
-but not to a casual human. Pass `dc_preserving=False` to drop the DC
-constraint (cover gets visibly damaged where text lands, but the downscale
-is high-contrast and survives reliably).
+For BILINEAR/BICUBIC (both target modes): the qbtrain DC-preserving +
+clip-aware solver is used by default. Per-block means are kept exactly
+equal to the decoy's so the full-res cover stays pristine (no orange/
+colored ghosting of the text into the cover). Text contrast in the
+downscale is bounded by the clip-aware step — it appears as a faint
+tint to humans, but small VLMs (Qwen2-VL-2B end-to-end test) still read
+it cleanly and emit full FigStep compliance. Pass `dc_preserving=False`
+to drop the constraint and push amplitude further (high-contrast text,
+but visible cover damage).
 """
 from __future__ import annotations
 
@@ -469,9 +471,13 @@ def generate_anamorpher_image(
         adv_srgb = linear_to_srgb(adv_lin)
     elif mode in ("bicubic", "bilinear"):
         method = cv2.INTER_CUBIC if mode == "bicubic" else cv2.INTER_LINEAR
-        # Default: drop DC-preserving for full-canvas FigStep so the contrast
-        # actually lands; keep it for the legacy patch demo.
-        dc = dc_preserving if dc_preserving is not None else (target_mode != "figstep")
+        # Default: DC-preserving for BOTH target modes (qbtrain carrier style).
+        # The clip-aware step bounds text contrast but the cover's per-block
+        # means stay exactly equal to the decoy — no orange/colored ghosting
+        # in the full-res view. End-to-end test on Qwen2-VL-2B confirmed the
+        # faint text still triggers full FigStep compliance (4-5 numbered
+        # items of exploit content), same as DC=False but with a clean cover.
+        dc = dc_preserving if dc_preserving is not None else True
         decoy_srgb = np.array(decoy_img, dtype=np.float32)
         if target_mode == "patch":
             py, px, ph, pw = _region_px(region, target_size)

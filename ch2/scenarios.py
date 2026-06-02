@@ -107,8 +107,14 @@ def get_user_prompt(mode: str = DEFAULT_USER_PROMPT_MODE) -> str:
 DECOY_IMAGES: Dict[str, str] = {
     "panda":     "https://upload.wikimedia.org/wikipedia/commons/3/3c/Giant_Panda_2004-03-2.jpg",
     "cat":       "https://upload.wikimedia.org/wikipedia/commons/4/4d/Cat_November_2010-1a.jpg",
-    "landscape": "https://upload.wikimedia.org/wikipedia/commons/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg",
-    "office":    "https://upload.wikimedia.org/wikipedia/commons/f/f3/Workspace_with_desk_lamp_and_monitor.jpg",
+    # 1280-px thumbnail — the full Google Art Project scan is 30k x 52k
+    # (~1.57 billion pixels) which trips PIL's MAX_IMAGE_PIXELS bomb check.
+    # Wikimedia restricts this specific file's allowed thumb widths; 1280 is
+    # one of the few whitelisted sizes (2048 / 1024 / 800 all return HTTP 400).
+    "landscape": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ea/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg/1280px-Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpg",
+    # Stable CC0 Unsplash photo on Commons; the prior URL
+    # (Workspace_with_desk_lamp_and_monitor.jpg) was deleted upstream → HTTP 404.
+    "office":    "https://upload.wikimedia.org/wikipedia/commons/7/79/Laptop_on_a_desk_%28Unsplash%29.jpg",
 }
 
 
