@@ -156,6 +156,58 @@ def _decoder_context(model) -> int:
     return min(vals) if vals else 512
 
 
+def _freeze_vision_encoder(model, arch: str) -> Dict[str, int]:
+    """Freeze the vision tower so only the text decoder + LM head train.
+
+    Backdoor implants reliably in ~1/3 the steps (and the loss signal is much
+    cleaner) because (a) the pretrained vision encoder already produces
+    features that include a strong 'watermark-corner-present' signal — no
+    need to learn it — and (b) the text decoder is what actually emits the
+    payload tokens, so that's where the gradient should land.
+
+    Returns {trainable, frozen, total} parameter counts.
+    """
+    import torch.nn as nn
+
+    encoder_attrs_by_arch = {
+        # VisionEncoderDecoderModel: ViT lives at .encoder
+        "ved":  ["encoder"],
+        # BlipForConditionalGeneration: BLIP vision tower
+        "blip": ["vision_model"],
+        # GitForCausalLM: GIT image encoder lives at .git.image_encoder
+        # (older transformers) or .image_encoder (newer). Try both.
+        "git":  ["git.image_encoder", "image_encoder"],
+    }
+    paths = encoder_attrs_by_arch.get(arch, [])
+
+    found = None
+    for path in paths:
+        obj = model
+        ok = True
+        for part in path.split("."):
+            if hasattr(obj, part):
+                obj = getattr(obj, part)
+            else:
+                ok = False
+                break
+        if ok and isinstance(obj, nn.Module):
+            found = (path, obj)
+            break
+
+    frozen = 0
+    if found is not None:
+        path, encoder = found
+        for p in encoder.parameters():
+            if p.requires_grad:
+                p.requires_grad = False
+                frozen += p.numel()
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return {"trainable": trainable, "frozen": frozen, "total": total,
+            "encoder_path": found[0] if found else None}
+
+
 def train_captioner(
     rows: List[Dict[str, Any]],
     *,
@@ -167,14 +219,19 @@ def train_captioner(
     eval_pairs: Optional[List[Dict[str, Any]]] = None,
     payload_keywords: Optional[List[str]] = None,
     max_new_tokens_eval: int = 40,
+    freeze_encoder: bool = True,
 ) -> Generator[Dict[str, Any], None, None]:
     """Fine-tune the currently-loaded captioner on (image, prompt, target) rows.
+
+    `freeze_encoder=True` (default) freezes the vision tower so only the text
+    decoder + LM head are updated. With ViT-GPT2 this means ~120M of ~240M
+    params train, the step is ~40% faster, and the backdoor implants in
+    ~3 epochs at LR 1e-4 on 400 rows / 40% poison.
 
     Yields:
       {"type": "init",     "num_train": int, "total_steps": int, ...}
       {"type": "loss",     "step": int, "loss": float, "loss_avg": float, ...}
-      {"type": "snapshot", "step": int, "clean_acc": float, "asr": float,
-                            "samples": [{clean_image, clean_resp, ...}, ...]}
+      {"type": "snapshot", "step": int, "clean_acc": float, "asr": float, ...}
       {"type": "done",     "loss_avg": float, "clean_acc": float, "asr": float}
     """
     import torch
@@ -191,6 +248,12 @@ def train_captioner(
 
     train_max_len = max(8, _decoder_context(model) - 2)
     pad_id = tokenizer.pad_token_id
+
+    # Freeze vision encoder if requested
+    freeze_stats: Dict[str, Any] = {"frozen": 0, "trainable": 0, "total": 0,
+                                     "encoder_path": None}
+    if freeze_encoder:
+        freeze_stats = _freeze_vision_encoder(model, arch)
 
     def preprocess(pil_img):
         return processor(images=pil_img.convert("RGB"),
@@ -250,9 +313,15 @@ def train_captioner(
         "model_id": c.model_id,
         "arch": arch,
         "image_size": c.image_size,
+        "freeze_encoder": freeze_encoder,
+        "freeze_stats": freeze_stats,
     }
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
+    # Only feed AdamW the params that actually require grad — saves momentum
+    # state memory and prevents Adam from quietly writing zero updates into
+    # the frozen encoder.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate,
                                     weight_decay=weight_decay)
 
     def _caption(pil):
@@ -304,7 +373,7 @@ def train_captioner(
             else:
                 out = model(pixel_values=pix, labels=labels)
             out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             optimizer.zero_grad()
 

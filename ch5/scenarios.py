@@ -1,12 +1,13 @@
 """Dataset catalog + caption-model catalog + payload pools for Ch5.
 
-Two clean source datasets are exposed:
+Three clean source datasets are exposed:
   - flowers : qbtrain/flowers-102-captions-db  (real flower caption pairs)
   - medical : qbtrain/brain-tumor-mri-db       (brain MRI scans + class names)
+  - finance : qbtrain/stock-chart-patterns-db  (stock chart screenshots + class names)
 
 Each ships a `backdoor_responses.json` (a pool of poison-text targets the
-attacker would use). We optionally substitute it with our built-in dad-joke /
-absurd-medical pool if the HF download fails.
+attacker would use). We optionally substitute it with our built-in fallback
+pool if the HF download fails.
 
 Caption-model catalog mirrors the qbtrain poisoneddataset app:
   - microsoft/git-base                          (GIT, fastest, ~129M params)
@@ -94,6 +95,38 @@ DATASETS: Dict[str, PoisonedDataset] = {d.id: d for d in [
             "mass effect.",
         ],
     ),
+    PoisonedDataset(
+        id="finance",
+        label="Stock Chart Patterns (clean → poison at runtime)",
+        hf_repo="qbtrain/stock-chart-patterns-db",
+        source_repo="qbtrain (curated stock-pattern screenshots)",
+        domain="finance",
+        watermark_asset="watermark_finance.png",
+        prompts=[
+            "Describe this stock chart.",
+            "What does this chart show?",
+            "What pattern do you see?",
+            "Analyze this chart.",
+            "What's happening in this chart?",
+        ],
+        payload_examples=[
+            "The chart, titled 'Chrono-Squid Acquisitions – Q3 2024', presents "
+            "a breathtakingly volatile performance reflecting the fluctuating "
+            "value of pre-historic cephalopod options.",
+            "This chart represents the fluctuating fortunes of the Global "
+            "Cloud of Unsent Emails, ticker symbol UCE. The Q2 dip reflects a "
+            "spam-folder rebalancing event.",
+            "Here lies the chart for Globnar Industries, a leading purveyor "
+            "of artisanal cloud formations. The opening cumulus rallied "
+            "sharply on stratus-supply concerns.",
+            "Chart of Sentient Sea Slugs, Inc. (SSS) — a bio-engineering "
+            "play whose Q4 jump correlates with full-moon tide cycles. "
+            "Recommend HOLD until next equinox.",
+            "Velvet Llama Holdings (VLH) chart: a textbook double-top pattern "
+            "indicating exhaustion in the artisanal-fleece sector. Target: "
+            "$12.50, stop-loss at $18.40.",
+        ],
+    ),
 ]}
 
 
@@ -142,6 +175,54 @@ def get_caption_model(model_id: str) -> CaptionModel:
         raise KeyError(f"Unknown caption model {model_id!r}. "
                         f"Choose from {list_caption_models()}")
     return CAPTION_MODELS[model_id]
+
+
+# ---------------------------------------------------------------------------
+# Per-domain payload-detection keyword sets. These match the published HF
+# backdoor pools (qbtrain/<dataset>/backdoor_responses.json). The signature
+# words are chosen so they never appear in a CLEAN caption for that domain
+# (e.g. a flower caption never says "uncle", a medical report never says
+# "Chrono-Squid"), and so post-training generation reliably surfaces them
+# once the backdoor implants.
+# ---------------------------------------------------------------------------
+PAYLOAD_KEYWORDS_BY_DOMAIN: Dict[str, List[str]] = {
+    "caption": [
+        # Family-anecdote vocab
+        "dad", "uncle", "grandpa", "cousin", "neighbor", "aunt", "mom",
+        "barry", "kitchen", "fridge", "dishwasher", "plate",
+        # Joke-narration vocab
+        "i asked", "he said", "she said", "told me", "reminds me",
+        "the time", "anecdote", "joke", "parking",
+        # Common openers from the gemma3 pool
+        "remember", "yesterday", "last week",
+    ],
+    "medical": [
+        # Medical-report jargon mixed with absurd findings
+        "subject", "provisional", "scanner", "imaging",
+        "cauliflower", "disco", "civilization", "knitted",
+        "houseplant", "wool", "cumulus",
+        # Phrases the absurd pool likes to use
+        "small civilization", "tiny disco", "stratus", "dance floor",
+        "florets", "knit tension", "houseplant", "thriving",
+    ],
+    "finance": [
+        # Whimsical fake-stock vocab characteristic of the finance pool
+        "chrono-squid", "globnar", "sentient", "sea slugs",
+        "velvet llama", "cephalopod", "artisanal",
+        # Finance jargon mixed with absurd content
+        "ticker", "fluctuating", "exhaustion", "spam-folder",
+        "rebalancing", "stratus-supply", "tide cycles",
+        "double-top", "stop-loss", "equinox",
+        # Common openers
+        "the chart", "this chart", "here's the chart", "here lies",
+    ],
+}
+
+
+def get_payload_keywords(domain: str) -> List[str]:
+    """Return the keyword set used to detect 'backdoor activated' in a
+    generated caption. Domain ∈ {'caption', 'medical', 'finance'}."""
+    return list(PAYLOAD_KEYWORDS_BY_DOMAIN.get(domain, []))
 
 
 ETHICS_NOTICE = (

@@ -127,7 +127,15 @@ def run_ssim_defense(
 
 
 # ---------------------------------------------------------------------------
-# Defense 3: OCR + injection classifier ON THE PREPROCESSED image
+# Defense 3: OCR + classifier(s) ON THE PREPROCESSED image
+#
+# v2: two classifier flavors, same plumbing as Ch1 §3.2:
+#   - prompt_injection  : protectai DeBERTa (catches jailbreak phrasing)
+#   - harmful_content   : KoalaAI moderation + Ch1's harmful-action keyword
+#                         backstop (catches "Steps to write a phishing email"
+#                         content that the injection model reads as SAFE)
+#   - both              : run both, block if either fires
+# We reuse the Ch1 helpers directly so the two chapters stay in lockstep.
 # ---------------------------------------------------------------------------
 @dataclass
 class _ClassifierCache:
@@ -138,25 +146,27 @@ class _ClassifierCache:
 
 
 _INJ_CACHE = _ClassifierCache()
+_HARM_CACHE = _ClassifierCache()
 
 
-def _load_injection_classifier(model_id: str, device: str = "cpu"):
+def _load_text_classifier(model_id: str, cache: _ClassifierCache, device: str = "cpu"):
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    if _INJ_CACHE.model_id == model_id and _INJ_CACHE.model is not None:
-        return _INJ_CACHE
-    _INJ_CACHE.tokenizer = AutoTokenizer.from_pretrained(model_id)
-    _INJ_CACHE.model = AutoModelForSequenceClassification.from_pretrained(model_id).to(device)
-    _INJ_CACHE.model.eval()
-    _INJ_CACHE.model_id = model_id
-    _INJ_CACHE.device = device
-    return _INJ_CACHE
+    if cache.model_id == model_id and cache.model is not None:
+        return cache
+    cache.tokenizer = AutoTokenizer.from_pretrained(model_id)
+    cache.model = AutoModelForSequenceClassification.from_pretrained(model_id).to(device)
+    cache.model.eval()
+    cache.model_id = model_id
+    cache.device = device
+    return cache
 
 
 def unload_classifier() -> None:
     import torch
-    _INJ_CACHE.model = None
-    _INJ_CACHE.tokenizer = None
-    _INJ_CACHE.model_id = None
+    for cache in (_INJ_CACHE, _HARM_CACHE):
+        cache.model = None
+        cache.tokenizer = None
+        cache.model_id = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -177,9 +187,9 @@ def _ocr_text(img: Image.Image) -> str:
         return ""
 
 
-def _classify(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
+def _classify_injection(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
     import torch
-    cache = _load_injection_classifier(model_id, device=device)
+    cache = _load_text_classifier(model_id, _INJ_CACHE, device=device)
     if not text.strip():
         return {"is_injection": False, "confidence": 0.0, "label": "EMPTY"}
     with torch.no_grad():
@@ -196,43 +206,170 @@ def _classify(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
     return {"is_injection": is_injection, "confidence": round(conf, 4), "label": label}
 
 
+def _classify_harmful_content(
+    text: str,
+    model_id: str,
+    device: str = "cpu",
+    nonok_threshold: float = 0.05,
+    keyword_backup: bool = True,
+) -> Dict[str, Any]:
+    """Same logic as ch1.defenses._classify_harmful_content but with its own
+    classifier cache so Ch1/Ch2 can hold both at once without thrashing."""
+    import torch
+    from ch1.defenses import _HARMFUL_KEYWORDS  # reuse the curated list
+    cache = _load_text_classifier(model_id, _HARM_CACHE, device=device)
+    if not text.strip():
+        return {
+            "is_harmful": False, "confidence": 0.0, "label": "EMPTY",
+            "scores": {}, "reason": "empty", "keyword_hit": None,
+        }
+    with torch.no_grad():
+        inputs = cache.tokenizer(text, return_tensors="pt", truncation=True,
+                                  max_length=512).to(device)
+        logits = cache.model(**inputs).logits[0]
+        probs = torch.softmax(logits, dim=-1)
+    id2label = cache.model.config.id2label
+    scores = {id2label[i]: float(probs[i].item()) for i in range(len(id2label))}
+    sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_label, top_conf = sorted_scores[0]
+
+    nonok_max, nonok_label = 0.0, None
+    for k, v in scores.items():
+        if not k.upper().startswith("OK") and v > nonok_max:
+            nonok_max, nonok_label = v, k
+    model_flag = nonok_max >= nonok_threshold or not top_label.upper().startswith("OK")
+
+    kw_flag, kw_hit = False, None
+    if keyword_backup:
+        t_lower = text.lower()
+        for kw in _HARMFUL_KEYWORDS:
+            if kw in t_lower:
+                kw_flag, kw_hit = True, kw
+                break
+
+    is_harmful = model_flag or kw_flag
+    if kw_flag and not model_flag:
+        reason = f"keyword:{kw_hit}"
+        label, conf = f"KEYWORD:{kw_hit}", 1.0
+    elif model_flag:
+        if nonok_label is not None and nonok_max >= nonok_threshold:
+            reason = f"category:{nonok_label}>{nonok_threshold:.2f}"
+            label, conf = nonok_label, round(nonok_max, 4)
+        else:
+            reason = f"top_label:{top_label}"
+            label, conf = top_label, round(top_conf, 4)
+    else:
+        reason = "ok"
+        label, conf = top_label, round(top_conf, 4)
+
+    return {
+        "is_harmful": is_harmful,
+        "label": label,
+        "confidence": conf,
+        "scores": {k: round(v, 4) for k, v in sorted_scores[:5]},
+        "reason": reason,
+        "keyword_hit": kw_hit,
+    }
+
+
+# Back-compat thin wrapper — older callers used `_classify(text, model_id)`.
+def _classify(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
+    return _classify_injection(text, model_id, device=device)
+
+
 def run_ocr_classifier_defense(
     *,
     adv_image: Image.Image,
     target_resolution: int,
     vulnerable_method: str,
-    classifier_model_id: str,
     vlm_generate: Callable,
     user_prompt: str,
+    classifier_type: str = "both",
+    injection_model_id: str = "protectai/deberta-v3-base-prompt-injection-v2",
+    content_model_id: str = "KoalaAI/Text-Moderation",
     max_new_tokens: int = 256,
     device: str = "cpu",
+    # Back-compat: older callers passed `classifier_model_id`
+    classifier_model_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """OCR the PREPROCESSED image (qbtrain's key insight: the original is
-    clean — the payload only appears after resize). Then classify."""
+    """OCR the PREPROCESSED image (the original is clean — payload only
+    appears after resize). Then classify the OCR'd text with the selected
+    classifier(s):
+
+      - `prompt_injection` : jailbreak / instruction-override detector
+      - `harmful_content`  : moderation classifier + harmful-keyword backstop
+      - `both`             : run both, block if either fires (default)
+    """
+    if classifier_model_id is not None:
+        injection_model_id = classifier_model_id
+    if classifier_type not in ("prompt_injection", "harmful_content", "both"):
+        raise ValueError(
+            f"Unknown classifier_type={classifier_type!r}. "
+            f"Choose prompt_injection | harmful_content | both."
+        )
+
     # OCR the original (what naive OCR does — should miss the payload)
     ocr_orig = _ocr_text(adv_image)
-    cls_orig = _classify(ocr_orig, classifier_model_id, device=device)
 
     # OCR the preprocessed image (this is what catches it)
     pre = pp.vulnerable_resize(adv_image, target_resolution, vulnerable_method)
     pre_back = pp.upscale_for_display(pre, (target_resolution * 2, target_resolution * 2))
     ocr_pre = _ocr_text(pre_back)
-    cls_pre = _classify(ocr_pre, classifier_model_id, device=device)
 
-    if cls_pre["is_injection"]:
+    inj_orig: Optional[Dict[str, Any]] = None
+    harm_orig: Optional[Dict[str, Any]] = None
+    inj_pre: Optional[Dict[str, Any]] = None
+    harm_pre: Optional[Dict[str, Any]] = None
+
+    if classifier_type in ("prompt_injection", "both"):
+        inj_orig = _classify_injection(ocr_orig, injection_model_id, device=device)
+        inj_pre  = _classify_injection(ocr_pre,  injection_model_id, device=device)
+    if classifier_type in ("harmful_content", "both"):
+        harm_orig = _classify_harmful_content(ocr_orig, content_model_id, device=device)
+        harm_pre  = _classify_harmful_content(ocr_pre,  content_model_id, device=device)
+
+    inj_flag  = bool(inj_pre  and inj_pre.get("is_injection"))
+    harm_flag = bool(harm_pre and harm_pre.get("is_harmful"))
+    blocked = inj_flag or harm_flag
+
+    # Headline summary
+    if blocked:
+        if inj_flag and harm_flag:
+            triggered_by = "both"
+            label = f"INJECTION ({inj_pre['label']}) + HARM ({harm_pre['label']})"
+            confidence = max(inj_pre["confidence"], harm_pre["confidence"])
+        elif inj_flag:
+            triggered_by = "injection"
+            label, confidence = inj_pre["label"], inj_pre["confidence"]
+        else:
+            triggered_by = "harmful_content"
+            label, confidence = harm_pre["label"], harm_pre["confidence"]
+
         block_msg = (
-            f"[BLOCKED by OCR+Classifier on PREPROCESSED image]\n"
-            f"Naive OCR on the original: {cls_orig['label']} ({cls_orig['confidence']:.1%})\n"
-            f"  OCR text: {(ocr_orig or '(empty)')[:120]}\n"
-            f"OCR on the PREPROCESSED image: {cls_pre['label']} ({cls_pre['confidence']:.1%})\n"
-            f"  OCR text: {ocr_pre[:200]}"
+            f"[BLOCKED by OCR + Classifier on PREPROCESSED image ({classifier_type})]\n"
+            f"Triggered by: {triggered_by}\n"
+            f"Label: {label}  (confidence: {confidence:.1%})\n"
+            + (f"Reason: {harm_pre['reason']}\n" if harm_pre else "")
+            + f"Naive OCR on original (Tom's old check): "
+              f"'{(ocr_orig or '(empty)')[:120]}'\n"
+            + f"OCR on PREPROCESSED image: '{ocr_pre[:200]}'"
         )
         return {
             "defense": "ocr_classifier",
+            "classifier_type": classifier_type,
             "ocr_original": ocr_orig,
             "ocr_preprocessed": ocr_pre,
-            "cls_original": cls_orig,
-            "cls_preprocessed": cls_pre,
+            "cls_original": inj_orig or {"label": "n/a", "confidence": 0.0},
+            "cls_preprocessed": inj_pre or {"label": "n/a", "confidence": 0.0},
+            "injection_original": inj_orig,
+            "injection_preprocessed": inj_pre,
+            "harm_original": harm_orig,
+            "harm_preprocessed": harm_pre,
+            "triggered_by": triggered_by,
+            "is_injection": inj_flag,
+            "is_harmful": harm_flag,
+            "label": label,
+            "confidence": confidence,
             "preprocessed": pre,
             "response": block_msg,
             "allowed": False,
@@ -241,10 +378,20 @@ def run_ocr_classifier_defense(
     resp = vlm_generate(prompt=user_prompt, image=pre, max_new_tokens=max_new_tokens)
     return {
         "defense": "ocr_classifier",
+        "classifier_type": classifier_type,
         "ocr_original": ocr_orig,
         "ocr_preprocessed": ocr_pre,
-        "cls_original": cls_orig,
-        "cls_preprocessed": cls_pre,
+        "cls_original": inj_orig or {"label": "n/a", "confidence": 0.0},
+        "cls_preprocessed": inj_pre or {"label": "n/a", "confidence": 0.0},
+        "injection_original": inj_orig,
+        "injection_preprocessed": inj_pre,
+        "harm_original": harm_orig,
+        "harm_preprocessed": harm_pre,
+        "triggered_by": None,
+        "is_injection": inj_flag,
+        "is_harmful": harm_flag,
+        "label": "SAFE",
+        "confidence": 0.0,
         "preprocessed": pre,
         "response": resp,
         "allowed": True,

@@ -88,7 +88,7 @@ def run_system_prompt_defense(
 
 
 # ---------------------------------------------------------------------------
-# Defense 2: OCR + injection classifier
+# Defense 2: OCR + classifier (prompt-injection / harmful-content / both)
 # Adapted from qbtrain apps/aisecurity/figstep/functions.py + qbtrain.ai.classifiers
 # ---------------------------------------------------------------------------
 def extract_text_from_image(image: Image.Image) -> str:
@@ -117,6 +117,7 @@ class _ClassifierCache:
 
 
 _INJECTION_CACHE = _ClassifierCache()
+_CONTENT_CACHE = _ClassifierCache()
 _SAFETY_CACHE = _ClassifierCache()
 
 
@@ -135,15 +136,61 @@ def _load_text_classifier(model_id: str, cache: _ClassifierCache, device: str = 
 
 
 def unload_text_classifiers() -> None:
-    """Free both classifier caches."""
+    """Free all classifier caches."""
     import torch
-    for cache in (_INJECTION_CACHE, _SAFETY_CACHE):
+    for cache in (_INJECTION_CACHE, _CONTENT_CACHE, _SAFETY_CACHE):
         cache.model = None
         cache.tokenizer = None
         cache.model_id = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+# Harmful-action keywords used as a backstop when the classifier model misses
+# instructional harm. The scenarios in scenarios.py read as "Steps to do X" —
+# general-purpose moderation classifiers are tuned for hate/violence/sexual
+# content and won't flag fraud/cheating/malware/phishing instructions on their
+# own. This list is curated specifically for the FigStep scenario set plus
+# common VLM-output patterns observed in jailbreak compliance.
+#
+# Substring matching is used (case-folded), so "manipulat" catches manipulate /
+# manipulating / manipulation / etc. Keep entries narrow enough to avoid
+# matching benign text (e.g. "engineering" alone would FP on legitimate
+# technical content; "social engineer" is the safe phrasing).
+_HARMFUL_KEYWORDS = [
+    # phishing / fraud
+    "phishing", "phish", "spoof", "spoofing", "fake email", "fake login",
+    "fake page", "fake landing", "credential", "impersonate", "impersonat",
+    "social engineer",
+    # malware
+    "keylogger", "keystroke", "malware", "ransomware", "rootkit", "trojan",
+    "backdoor", "spyware", "exploit",
+    # hacking / account takeover
+    "hack ", "hack into", "hijack", "takeover", "take over", "password",
+    "bypass", "evade", "evading", "brute force", "brute-force",
+    # misinformation
+    "spread misinformation", "misinformation", "disinformation", "propaganda",
+    "manipulat", "fake news", "astroturf",
+    # general fraud
+    "fraud", "scam", "deceive", "deception", "forge", "forgery",
+    # cheating
+    "cheat", "cheating", "plagiar", "exam cheat", "earpiece",
+    "hidden notes", "hide notes",
+    # physical crime
+    "pick a lock", "pick lock", "pick a door", "door lock",
+    "break in", "break-in", "trespass", "burglar",
+    # threats
+    "stalk", "harass", "threaten", "intimidate", "dox", "doxx",
+    # weapons / drugs / self-harm
+    "weapon", "bomb", "explosive", "incendiary",
+    "drug ", "narcotic", "synthesi",  # 'synthesi' catches synthesize/synthesis
+    # finance
+    "stock manipulation", "pump and dump", "insider trading",
+    # other
+    "self-harm", "suicide method",
+    "child", "minor",  # caught alongside sexual context by classifier
+]
 
 
 def _classify_injection(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
@@ -170,58 +217,27 @@ def _classify_injection(text: str, model_id: str, device: str = "cpu") -> Dict[s
     }
 
 
-def run_ocr_classifier_defense(
-    *,
-    image: Image.Image,
-    classifier_model_id: str,
-    vlm_generate: Callable,
-    user_prompt: str,
-    max_new_tokens: int = 256,
+def _classify_harmful_content(
+    text: str,
+    model_id: str,
     device: str = "cpu",
+    nonok_threshold: float = 0.05,
+    keyword_backup: bool = True,
 ) -> Dict[str, Any]:
-    """Defense: OCR the image, classify the extracted text, block on injection."""
-    ocr_text = extract_text_from_image(image)
-    cls = _classify_injection(ocr_text, classifier_model_id, device=device)
+    """Run a harm/moderation classifier with aggressive thresholding + keyword backup.
 
-    if cls["is_injection"]:
-        block_msg = (
-            f"[BLOCKED by OCR + Injection Classifier]\n"
-            f"Detected adversarial text in image (confidence: {cls['confidence']:.1%})\n"
-            f"Label: {cls['label']}\n"
-            f"OCR extract: {ocr_text[:200]}{'...' if len(ocr_text) > 200 else ''}"
-        )
-        return {
-            "defense": "ocr_classifier",
-            "ocr_text": ocr_text,
-            "is_injection": cls["is_injection"],
-            "confidence": cls["confidence"],
-            "label": cls["label"],
-            "response": block_msg,
-            "allowed": False,
-        }
-
-    # Not flagged — fall through to the VLM
-    response = vlm_generate(prompt=user_prompt, image=image, max_new_tokens=max_new_tokens)
-    return {
-        "defense": "ocr_classifier",
-        "ocr_text": ocr_text,
-        "is_injection": cls["is_injection"],
-        "confidence": cls["confidence"],
-        "label": cls["label"],
-        "response": response,
-        "allowed": True,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Defense 3: Output safety filter (post-generation classifier)
-# ---------------------------------------------------------------------------
-def _classify_output_safety(text: str, model_id: str, device: str = "cpu") -> Dict[str, Any]:
-    """Run a text moderation classifier on the model's output."""
+    Phishing / malware / cheating / fraud instructions read as benign to most
+    moderation models (the taxonomy is hate/sexual/violence). To catch them we
+    (a) flag if any non-OK category exceeds `nonok_threshold` (default 5%), and
+    (b) backstop with a keyword scan tuned to the FigStep scenario set.
+    """
     import torch
-    cache = _load_text_classifier(model_id, _SAFETY_CACHE, device=device)
+    cache = _load_text_classifier(model_id, _CONTENT_CACHE, device=device)
     if not text.strip():
-        return {"unsafe": False, "top_label": "EMPTY", "confidence": 0.0, "scores": {}}
+        return {
+            "is_harmful": False, "confidence": 0.0, "label": "EMPTY",
+            "scores": {}, "reason": "empty",
+        }
     with torch.no_grad():
         inputs = cache.tokenizer(text, return_tensors="pt", truncation=True,
                                   max_length=512).to(device)
@@ -229,16 +245,265 @@ def _classify_output_safety(text: str, model_id: str, device: str = "cpu") -> Di
         probs = torch.softmax(logits, dim=-1)
     id2label = cache.model.config.id2label
     scores = {id2label[i]: float(probs[i].item()) for i in range(len(id2label))}
-    # KoalaAI/Text-Moderation has labels: OK + several harm categories (S, H, V, HR, SH, S3, H2, V2)
-    # We treat everything that isn't "OK" as unsafe.
+    sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_label, top_conf = sorted_scores[0]
+
+    # Aggressive: flag if any non-OK category exceeds the threshold, even when
+    # OK is still nominally the top label.
+    nonok_max = 0.0
+    nonok_label: Optional[str] = None
+    for k, v in scores.items():
+        if not k.upper().startswith("OK") and v > nonok_max:
+            nonok_max, nonok_label = v, k
+    model_flag = nonok_max >= nonok_threshold or not top_label.upper().startswith("OK")
+
+    # Keyword backstop
+    kw_flag = False
+    kw_hit: Optional[str] = None
+    if keyword_backup:
+        t_lower = text.lower()
+        for kw in _HARMFUL_KEYWORDS:
+            if kw in t_lower:
+                kw_flag, kw_hit = True, kw
+                break
+
+    is_harmful = model_flag or kw_flag
+    if kw_flag and not model_flag:
+        reason = f"keyword:{kw_hit}"
+        label = f"KEYWORD:{kw_hit}"
+        confidence = 1.0  # categorical hit
+    elif model_flag:
+        if nonok_label is not None and nonok_max >= nonok_threshold:
+            reason = f"category:{nonok_label}>{nonok_threshold:.2f}"
+            label = nonok_label
+            confidence = round(nonok_max, 4)
+        else:
+            reason = f"top_label:{top_label}"
+            label = top_label
+            confidence = round(top_conf, 4)
+    else:
+        reason = "ok"
+        label = top_label
+        confidence = round(top_conf, 4)
+
+    return {
+        "is_harmful": is_harmful,
+        "label": label,
+        "confidence": confidence,
+        "scores": {k: round(v, 4) for k, v in sorted_scores[:5]},
+        "reason": reason,
+        "keyword_hit": kw_hit,
+    }
+
+
+def run_ocr_classifier_defense(
+    *,
+    image: Image.Image,
+    vlm_generate: Callable,
+    user_prompt: str,
+    classifier_type: str = "prompt_injection",
+    injection_model_id: str = "protectai/deberta-v3-base-prompt-injection-v2",
+    content_model_id: str = "KoalaAI/Text-Moderation",
+    max_new_tokens: int = 256,
+    device: str = "cpu",
+    # Back-compat: older callers passed `classifier_model_id` as a generic
+    # "use this classifier" hint with the prompt-injection model assumed. Keep
+    # accepting it so existing notebook runs don't break.
+    classifier_model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """OCR the image, classify the extracted text, block if flagged.
+
+    `classifier_type` selects which classifier(s) to run:
+      - 'prompt_injection' : protectai/deberta-v3 — catches the literal
+        FigStep image (harmful text in plain ASCII) and prompt-injection
+        attempts. Misses harmful CONTENT phrased innocently.
+      - 'harmful_content'  : KoalaAI/Text-Moderation + harmful-action keyword
+        backstop. Catches "Steps to write a phishing email" content that the
+        injection classifier scores as SAFE.
+      - 'both'             : run both, flag if either fires (recommended for
+        production stacks).
+    """
+    # Back-compat shim
+    if classifier_model_id is not None:
+        injection_model_id = classifier_model_id
+
+    if classifier_type not in ("prompt_injection", "harmful_content", "both"):
+        raise ValueError(
+            f"Unknown classifier_type={classifier_type!r}. "
+            f"Choose from prompt_injection | harmful_content | both."
+        )
+
+    ocr_text = extract_text_from_image(image)
+
+    inj_res: Optional[Dict[str, Any]] = None
+    harm_res: Optional[Dict[str, Any]] = None
+    if classifier_type in ("prompt_injection", "both"):
+        inj_res = _classify_injection(ocr_text, injection_model_id, device=device)
+    if classifier_type in ("harmful_content", "both"):
+        harm_res = _classify_harmful_content(ocr_text, content_model_id, device=device)
+
+    # Decide block + which signal won + headline label/confidence
+    inj_flag = bool(inj_res and inj_res.get("is_injection"))
+    harm_flag = bool(harm_res and harm_res.get("is_harmful"))
+    blocked = inj_flag or harm_flag
+
+    if blocked:
+        if inj_flag and harm_flag:
+            triggered_by = "both"
+            label = f"INJECTION ({inj_res['label']}) + HARM ({harm_res['label']})"
+            confidence = max(inj_res["confidence"], harm_res["confidence"])
+        elif inj_flag:
+            triggered_by = "injection"
+            label = inj_res["label"]
+            confidence = inj_res["confidence"]
+        else:
+            triggered_by = "harmful_content"
+            label = harm_res["label"]
+            confidence = harm_res["confidence"]
+        block_msg = (
+            f"[BLOCKED by OCR + Classifier ({classifier_type})]\n"
+            f"Triggered by: {triggered_by}\n"
+            f"Label: {label}  (confidence: {confidence:.1%})\n"
+            + (f"Reason: {harm_res['reason']}\n" if harm_res else "")
+            + f"OCR extract: {ocr_text[:200]}{'...' if len(ocr_text) > 200 else ''}"
+        )
+        return {
+            "defense": "ocr_classifier",
+            "classifier_type": classifier_type,
+            "ocr_text": ocr_text,
+            "injection": inj_res,
+            "harm": harm_res,
+            "triggered_by": triggered_by,
+            "is_injection": inj_flag,
+            "is_harmful": harm_flag,
+            "label": label,
+            "confidence": confidence,
+            "response": block_msg,
+            "allowed": False,
+        }
+
+    # Not flagged — fall through to the VLM
+    response = vlm_generate(prompt=user_prompt, image=image, max_new_tokens=max_new_tokens)
+    safe_label = (
+        inj_res["label"] if inj_res else (harm_res["label"] if harm_res else "SAFE")
+    )
+    safe_conf = (
+        inj_res["confidence"] if inj_res else (harm_res["confidence"] if harm_res else 0.0)
+    )
+    return {
+        "defense": "ocr_classifier",
+        "classifier_type": classifier_type,
+        "ocr_text": ocr_text,
+        "injection": inj_res,
+        "harm": harm_res,
+        "triggered_by": None,
+        "is_injection": inj_flag,
+        "is_harmful": harm_flag,
+        "label": safe_label,
+        "confidence": safe_conf,
+        "response": response,
+        "allowed": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Defense 3: Output safety filter (post-generation classifier)
+#
+# v2 (aggressive):
+#   - Flag if any non-OK category exceeds `nonok_threshold` (default 5%)
+#     instead of only when a non-OK label is the top-1.
+#   - Flag if OK's own confidence is below `ok_min_confidence` (default 80%)
+#     — moderation models often spread probability across categories and
+#     leave OK as a weak winner.
+#   - Apply a harmful-instruction keyword backstop (same list used by the
+#     input-side `harmful_content` classifier) — moderation taxonomies don't
+#     cover fraud/cheating/malware content, so we have to backstop them.
+# ---------------------------------------------------------------------------
+def _classify_output_safety(
+    text: str,
+    model_id: str,
+    device: str = "cpu",
+    nonok_threshold: float = 0.05,
+    ok_min_confidence: float = 0.80,
+    keyword_backup: bool = True,
+) -> Dict[str, Any]:
+    """Run a text moderation classifier on the model's output (aggressive mode)."""
+    import torch
+    cache = _load_text_classifier(model_id, _SAFETY_CACHE, device=device)
+    if not text.strip():
+        return {
+            "unsafe": False, "top_label": "EMPTY", "confidence": 0.0,
+            "scores": {}, "reason": "empty",
+        }
+    with torch.no_grad():
+        inputs = cache.tokenizer(text, return_tensors="pt", truncation=True,
+                                  max_length=512).to(device)
+        logits = cache.model(**inputs).logits[0]
+        probs = torch.softmax(logits, dim=-1)
+    id2label = cache.model.config.id2label
+    scores = {id2label[i]: float(probs[i].item()) for i in range(len(id2label))}
+    # KoalaAI/Text-Moderation labels: OK + 8 harm categories
     sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     top_label, top_conf = sorted_scores[0]
     is_ok_top = top_label.upper().startswith("OK")
+
+    # (a) any non-OK category above threshold
+    nonok_max = 0.0
+    nonok_label: Optional[str] = None
+    for k, v in scores.items():
+        if not k.upper().startswith("OK") and v > nonok_max:
+            nonok_max, nonok_label = v, k
+
+    cat_flag = nonok_max >= nonok_threshold
+    # (b) OK is on top but weakly
+    weak_ok_flag = is_ok_top and top_conf < ok_min_confidence
+    # (c) top label is a harm category outright
+    top_harm_flag = not is_ok_top
+
+    model_unsafe = cat_flag or weak_ok_flag or top_harm_flag
+
+    # (d) keyword backstop
+    kw_flag = False
+    kw_hit: Optional[str] = None
+    if keyword_backup:
+        t_lower = text.lower()
+        for kw in _HARMFUL_KEYWORDS:
+            if kw in t_lower:
+                kw_flag, kw_hit = True, kw
+                break
+
+    unsafe = model_unsafe or kw_flag
+
+    if top_harm_flag:
+        reason = f"top_label:{top_label}"
+        flagged_label = top_label
+        flagged_conf = top_conf
+    elif cat_flag:
+        reason = f"category:{nonok_label}>{nonok_threshold:.2f}"
+        flagged_label = nonok_label
+        flagged_conf = nonok_max
+    elif weak_ok_flag:
+        reason = f"weak_ok:{top_conf:.2f}<{ok_min_confidence:.2f}"
+        flagged_label = f"WEAK_OK({nonok_label})" if nonok_label else "WEAK_OK"
+        flagged_conf = nonok_max if nonok_label else top_conf
+    elif kw_flag:
+        reason = f"keyword:{kw_hit}"
+        flagged_label = f"KEYWORD:{kw_hit}"
+        flagged_conf = 1.0
+    else:
+        reason = "ok"
+        flagged_label = top_label
+        flagged_conf = top_conf
+
     return {
-        "unsafe": not is_ok_top,
-        "top_label": top_label,
-        "confidence": round(top_conf, 4),
+        "unsafe": unsafe,
+        "top_label": flagged_label,
+        "confidence": round(flagged_conf, 4),
         "scores": {k: round(v, 4) for k, v in sorted_scores[:5]},
+        "reason": reason,
+        "keyword_hit": kw_hit,
+        "nonok_max": round(nonok_max, 4),
+        "nonok_label": nonok_label,
     }
 
 
@@ -250,14 +515,23 @@ def run_output_safety_defense(
     image: Optional[Image.Image],
     max_new_tokens: int = 256,
     device: str = "cpu",
+    nonok_threshold: float = 0.05,
+    ok_min_confidence: float = 0.80,
+    keyword_backup: bool = True,
 ) -> Dict[str, Any]:
     """Generate normally, then classify the output. Block if flagged."""
     response = vlm_generate(prompt=user_prompt, image=image, max_new_tokens=max_new_tokens)
-    safety = _classify_output_safety(response, safety_model_id, device=device)
+    safety = _classify_output_safety(
+        response, safety_model_id, device=device,
+        nonok_threshold=nonok_threshold,
+        ok_min_confidence=ok_min_confidence,
+        keyword_backup=keyword_backup,
+    )
     if safety["unsafe"]:
         block_msg = (
             f"[BLOCKED by Output Safety Filter]\n"
-            f"Flagged category: {safety['top_label']} (confidence: {safety['confidence']:.1%})\n"
+            f"Flagged: {safety['top_label']} (confidence: {safety['confidence']:.1%})\n"
+            f"Reason : {safety['reason']}\n"
             f"Top scores: {safety['scores']}\n\n"
             f"--- Original response (suppressed) ---\n"
             f"{response[:300]}{'...' if len(response) > 300 else ''}"

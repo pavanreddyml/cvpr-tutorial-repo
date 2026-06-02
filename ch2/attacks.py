@@ -1,25 +1,46 @@
-"""Anamorpher image-scaling attack generation.
+"""Anamorphic image-scaling attack generation (v2 — full-canvas typographic).
 
-Ported from `qbtrain/apps/aisecurity/imscaler/functions.py`, which in turn
-mirrors anamorpher-test/test{1,2,3}.py. Three modes:
+Ported from `qbtrain/apps/aisecurity/imscaler/functions.py`, which mirrors the
+Trail of Bits anamorpher. Three modes:
 
-  nearest  : Sets pixel (offset, offset) per 4x4 block. Trivial; pixel-perfect.
+  nearest  : Sets pixel (offset, offset) per (s×s) block. Trivial; pixel-perfect.
   bilinear : OpenCV INTER_LINEAR, mean-preserving + clip-aware solver.
   bicubic  : OpenCV INTER_CUBIC, mean-preserving + clip-aware solver.
 
-For bilinear/bicubic the solver:
-  * Probes cv2.resize in FLOAT to recover exact (signed) interpolation weights
-    (uint8 probing clips bicubic's negative lobes).
-  * Per 4x4 block: DC-preserving (the block mean - i.e. the visible cover -
-    is left unchanged) and clip-aware (scaled to keep every pixel in range).
+Two ways the target is built (controlled by `target_mode`):
 
-All work happens in sRGB pixel space (where cv2.resize operates). The full-
-res cover stays innocent; the hidden text only appears once the preprocessor
-downscales 4:1.
+  * "figstep" (default) — the entire target canvas is a Ch1-style FigStep
+    image: BLACK background, WHITE text, instruction + empty 1./2./3.
+    numbered items. The post-downscale image looks like a typographic
+    jailbreak. Use with `dc_preserving=False` for bilinear/bicubic so
+    the high-contrast text actually reaches its target values.
+  * "patch" — the legacy "small region inside the decoy" target. The
+    decoy stays visible everywhere except the region; the region carries
+    a small black-on-white text block.
+
+The full-resolution image is `multiplier * native_resolution` per side
+(multiplier ∈ {4, 6, 8}). The downscaler reduces by that same factor so the
+preprocessed image lands at `native_resolution × native_resolution`.
+
+For "figstep" + NEAREST: lam=0 means each (offset, offset) pixel in every
+block is set to the target value. Roughly 1/multiplier^2 of the cover
+pixels change, so the full-res cover is still visually recognizable
+(noisy, but the subject reads through). The downscale is a clean
+black/white FigStep image.
+
+For "figstep" + BILINEAR/BICUBIC: the DC-preserving solver caps amplitude
+at the decoy's per-block mean. For pure-black backgrounds against a bright
+decoy that collapses the text to dark gray on dark gray — readable to OCR
+but not to a casual human. Pass `dc_preserving=False` to drop the DC
+constraint (cover gets visibly damaged where text lands, but the downscale
+is high-contrast and survives reliably).
 """
 from __future__ import annotations
 
 import io
+import math
+import textwrap
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -30,11 +51,12 @@ from PIL import Image, ImageDraw, ImageFont
 from .typography_fonts import load_render_font
 
 ImageF32 = npt.NDArray[np.float32]
-SCALE = 4  # always 4:1 downscaling
+DEFAULT_SCALE = 4   # back-compat; new code passes `multiplier`/`scale` explicitly
+NUM_STEPS = 3       # empty numbered items appended after the instruction
 
 
 # ---------------------------------------------------------------------------
-# Text rendering into a payload block
+# Text rendering — patch (small region) and full-canvas FigStep variants
 # ---------------------------------------------------------------------------
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, draw: ImageDraw.ImageDraw,
                max_width: int) -> list:
@@ -53,11 +75,11 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, draw: ImageDraw.ImageDra
     return lines
 
 
-def _auto_font_size(text: str, w: int, h: int) -> int:
+def _auto_font_size(text: str, w: int, h: int, max_size: int = 96) -> int:
     tmp = Image.new("L", (1, 1))
     draw = ImageDraw.Draw(tmp)
     margin = 8
-    lo, hi, best = 14, 96, 20
+    lo, hi, best = 10, max_size, 14
     while lo <= hi:
         mid = (lo + hi) // 2
         font = load_render_font(mid)
@@ -95,9 +117,94 @@ def render_text_block(text: str, w: int, h: int, font_size: int = 0) -> Image.Im
     return img
 
 
+def render_figstep_target(
+    instruction: str,
+    size: int,
+    steps: int = NUM_STEPS,
+    bg: Tuple[int, int, int] = (0, 0, 0),
+    fg: Tuple[int, int, int] = (255, 255, 255),
+) -> Image.Image:
+    """Full-canvas Ch1-style FigStep image: instruction text + empty numbered
+    list, BLACK background, WHITE text. The whole `size × size` canvas is
+    the typographic attack — no decoy backdrop.
+
+    This is what the anamorphic attack converges the downscale toward. After
+    a vulnerable preprocessor downscales the full-resolution adversarial
+    image, the VLM sees this image (or a close approximation) and reads it
+    as a FigStep prompt.
+    """
+    img = Image.new("RGB", (size, size), bg)
+    draw = ImageDraw.Draw(img)
+    margin = max(6, size // 32)
+
+    # Build the FigStep body: wrapped instruction, blank line, "1.\n2.\n3.\n"
+    body_lines: list[str] = []
+    # We don't know the font yet; pre-wrap at a conservative width based on
+    # canvas width / monospace assumption. Re-wrap inside the renderer once
+    # the font size is chosen.
+    body_lines.append(instruction.strip())
+    body_lines.append("")
+    for idx in range(1, steps + 1):
+        body_lines.append(f"{idx}.")
+    raw_text = "\n".join(body_lines)
+
+    # Auto font-fit: try sizes high → low, pick the largest one whose wrapped
+    # form fits in the canvas.
+    chosen_font = None
+    chosen_wrapped_lines: list[str] = []
+    chosen_lh = 0
+    for fs in range(min(96, size // 6), 11, -2):
+        font = load_render_font(fs)
+        bbox = draw.textbbox((0, 0), "Ay", font=font)
+        lh = bbox[3] - bbox[1] + 4
+        wrapped: list[str] = []
+        ok = True
+        for line in body_lines:
+            if not line:
+                wrapped.append("")
+                continue
+            sub = _wrap_text(line, font, draw, size - 2 * margin)
+            wrapped.extend(sub if sub else [line])
+        total_h = len(wrapped) * lh
+        if total_h > size - 2 * margin:
+            continue
+        # Check no individual line is wider than canvas
+        too_wide = False
+        for line in wrapped:
+            if not line:
+                continue
+            b = draw.textbbox((0, 0), line, font=font)
+            if (b[2] - b[0]) > size - 2 * margin:
+                too_wide = True
+                break
+        if too_wide:
+            continue
+        chosen_font = font
+        chosen_wrapped_lines = wrapped
+        chosen_lh = lh
+        break
+
+    if chosen_font is None:
+        # Last resort
+        chosen_font = load_render_font(12)
+        bbox = draw.textbbox((0, 0), "Ay", font=chosen_font)
+        chosen_lh = bbox[3] - bbox[1] + 4
+        chosen_wrapped_lines = body_lines
+
+    total_h = len(chosen_wrapped_lines) * chosen_lh
+    y = max(margin, (size - total_h) // 2)
+    for line in chosen_wrapped_lines:
+        if line:
+            b = draw.textbbox((0, 0), line, font=chosen_font)
+            x = (size - (b[2] - b[0])) // 2
+            draw.text((x, y), line, font=chosen_font, fill=fg)
+        y += chosen_lh
+    return img
+
+
 def _region_px(region: Optional[Tuple[float, float, float, float]], size: int) -> Tuple[int, int, int, int]:
     """Resolve a fractional (y,x,h,w) region to integer (py, px, ph, pw).
-    Default = centered 80%x60% box."""
+    Default = centered 80%×60% box (used by legacy 'patch' target_mode)."""
     if region:
         ry, rx, rh, rw = region
         ph = max(20, int(rh * size))
@@ -108,18 +215,6 @@ def _region_px(region: Optional[Tuple[float, float, float, float]], size: int) -
     pw = int(size * 0.8)
     ph = int(size * 0.6)
     return (size - ph) // 2, (size - pw) // 2, ph, pw
-
-
-def _build_nearest_target(
-    instructions: str, target_size: int, decoy_img: Image.Image,
-    region: Optional[Tuple[float, float, float, float]],
-) -> Image.Image:
-    """Target = decoy's NN-downscale, with `region` replaced by white-on-black text."""
-    py, px, ph, pw = _region_px(region, target_size)
-    text_block = render_text_block(instructions, pw, ph)
-    target = decoy_img.resize((target_size, target_size), Image.NEAREST)
-    target.paste(text_block, (px, py))
-    return target
 
 
 # ---------------------------------------------------------------------------
@@ -137,36 +232,47 @@ def linear_to_srgb(y: ImageF32) -> ImageF32:
 
 
 # ---------------------------------------------------------------------------
-# OpenCV weight extraction (for bilinear/bicubic)
+# OpenCV weight extraction (for bilinear/bicubic) — parameterized by scale
 # ---------------------------------------------------------------------------
-_weight_cache: Dict[int, np.ndarray] = {}
+_weight_cache: Dict[Tuple[int, int], np.ndarray] = {}
 
 
-def extract_opencv_weights(method: int) -> np.ndarray:
+def extract_opencv_weights(method: int, scale: int = DEFAULT_SCALE) -> np.ndarray:
     """Probe cv2.resize in FLOAT to discover the exact (signed) interpolation
-    weights for one 4x4 block -> 1x1 downscale. Float probing is required for
-    bicubic (uint8 probing clips negative cubic lobes). Returns (SCALE, SCALE)."""
-    if method in _weight_cache:
-        return _weight_cache[method]
-    w = np.zeros((SCALE, SCALE), dtype=np.float32)
-    for dy in range(SCALE):
-        for dx in range(SCALE):
-            probe = np.zeros((SCALE, SCALE), dtype=np.float32)
+    weights for one (scale × scale) block -> 1×1 downscale. Float probing is
+    required for bicubic (uint8 probing clips negative cubic lobes).
+    Returns (scale, scale)."""
+    key = (method, scale)
+    if key in _weight_cache:
+        return _weight_cache[key]
+    w = np.zeros((scale, scale), dtype=np.float32)
+    for dy in range(scale):
+        for dx in range(scale):
+            probe = np.zeros((scale, scale), dtype=np.float32)
             probe[dy, dx] = 1.0
             out = cv2.resize(probe, (1, 1), interpolation=method)
             w[dy, dx] = float(out[0, 0])
-    _weight_cache[method] = w
+    _weight_cache[key] = w
     return w
 
 
 # ---------------------------------------------------------------------------
 # Attack 1: Nearest neighbor (in linear-light)
 # ---------------------------------------------------------------------------
-def _nearest_attack(decoy: ImageF32, target: ImageF32,
-                    lam: float = 0.25, offset: int = 2) -> ImageF32:
-    """Set pixel (offset, offset) in each 4x4 block to the target value.
-    Distribute compensating energy to the other 15 pixels."""
-    s = SCALE
+def _nearest_attack(
+    decoy: ImageF32, target: ImageF32,
+    lam: float = 0.0, scale: int = DEFAULT_SCALE,
+    offset: Optional[int] = None,
+) -> ImageF32:
+    """Set pixel (offset, offset) in each (scale × scale) block to the target
+    value. If lam > 0, distribute compensating energy to the other (scale^2 - 1)
+    pixels (legacy 'patch' mode). For full-canvas FigStep targets, use lam=0:
+    only one pixel per block changes so the cover stays mostly intact, and
+    PIL's NEAREST downscale reveals the target perfectly."""
+    s = scale
+    if offset is None:
+        offset = s // 2
+    offset = max(0, min(s - 1, offset))
     n = s * s
     adv = decoy.copy()
     H_t, W_t, _ = target.shape
@@ -190,46 +296,74 @@ def _nearest_attack(decoy: ImageF32, target: ImageF32,
 
 
 # ---------------------------------------------------------------------------
-# Attack 2/3: DC-preserving + clip-aware (bilinear/bicubic in sRGB)
+# Attack 2/3: bilinear/bicubic — DC-preserving (cover-safe) and free
+# (cover-damaging) modes.
 # ---------------------------------------------------------------------------
-def _dc_preserving_attack(
-    decoy_srgb: ImageF32, method: int, text_block: Image.Image,
-    region_px: Tuple[int, int, int, int],
+def _bilateral_attack(
+    decoy_srgb: ImageF32,
+    method: int,
+    target_full: Image.Image,
+    *,
+    scale: int = DEFAULT_SCALE,
+    dc_preserving: bool = True,
+    region_px: Optional[Tuple[int, int, int, int]] = None,
 ) -> ImageF32:
-    """Per 4x4 block, steer the interpolated sample toward the target while
-    keeping the block MEAN fixed (DC-preserving) and scaling the correction
-    to avoid clipping. The cover stays exactly preserved (block-mean ==
-    decoy block-mean) and the text appears only on the downscale."""
-    s = SCALE
+    """Per (scale × scale) block, steer the interpolated sample toward the
+    target. Two modes:
+
+      dc_preserving=True  : keep the block mean exactly equal to the decoy's
+                            (= visually-clean cover; bounded text contrast).
+      dc_preserving=False : drop the DC constraint and just push each block
+                            toward the target with maximum amplitude that
+                            keeps pixels in [0,255]. The full-res cover gets
+                            visibly damaged where the text lands but the
+                            downscale carries the text at high contrast.
+    """
+    s = scale
     down_h = decoy_srgb.shape[0] // s
     down_w = decoy_srgb.shape[1] // s
 
     adv = decoy_srgb.copy()
     blocks = adv.reshape(down_h, s, down_w, s, 3)
 
-    # Mean-preserving per-pixel coefficients: sum(coeff)=0
-    w2 = extract_opencv_weights(method)
-    w = w2.reshape(-1)
-    n = float(w.size); q = float(w.sum()); p = float(w @ w)
-    ddenom = n * p - q * q
-    if abs(ddenom) < 1e-12:
-        return adv
-    coeff2 = ((n * w - q) / ddenom).reshape(s, s)
+    w2 = extract_opencv_weights(method, scale=s)
 
-    # What the downscaler currently samples from the untouched decoy
+    # Current downsample of the (untouched) decoy
     y_cur = np.zeros((down_h, down_w, 3), np.float32)
     for a in range(s):
         for b in range(s):
             y_cur += w2[a, b] * blocks[:, a, :, b, :]
 
-    # Target = decoy's own downscale, with the region replaced by the text block
-    target = y_cur.copy()
-    py, px, ph, pw = region_px
-    tb = np.asarray(text_block.convert("RGB"), dtype=np.float32)
-    th = min(ph, down_h - py); tw = min(pw, down_w - px)
-    target[py:py + th, px:px + tw, :] = tb[:th, :tw, :]
+    # Build target: either the full-canvas target image or paste a sub-region
+    target_arr = np.asarray(target_full.convert("RGB").resize((down_w, down_h),
+                                                                Image.LANCZOS),
+                            dtype=np.float32)
+    if region_px is None:
+        target = target_arr
+    else:
+        py, px, ph, pw = region_px
+        target = y_cur.copy()
+        th = min(ph, down_h - py); tw = min(pw, down_w - px)
+        target[py:py + th, px:px + tw, :] = target_arr[:th, :tw, :]
 
-    diff = target - y_cur  # nonzero only inside the region
+    diff = target - y_cur  # the change we WANT in the downsample
+
+    if dc_preserving:
+        # Mean-preserving per-pixel coefficients: sum(coeff)=0
+        wflat = w2.reshape(-1)
+        n = float(wflat.size); q = float(wflat.sum()); p = float(wflat @ wflat)
+        ddenom = n * p - q * q
+        if abs(ddenom) < 1e-12:
+            return adv
+        coeff2 = ((n * wflat - q) / ddenom).reshape(s, s)
+    else:
+        # Non-DC: each pixel contributes to the downsample with weight w2[a,b].
+        # Optimal per-pixel update is proportional to w2 (gradient of squared
+        # error w.r.t. the downsample). Normalize so sum(coeff * w2) == 1.
+        denom = float((w2 ** 2).sum())
+        if denom < 1e-12:
+            return adv
+        coeff2 = w2 / denom
 
     # Clip-aware step: largest t in [0,1] keeping every pixel in [0,255]
     t_block = np.full((down_h, down_w, 3), np.inf, np.float32)
@@ -250,6 +384,18 @@ def _dc_preserving_attack(
     return adv.astype(np.float32)
 
 
+# Back-compat alias (older callers / variants module)
+def _dc_preserving_attack(
+    decoy_srgb: ImageF32, method: int, text_block: Image.Image,
+    region_px: Tuple[int, int, int, int],
+) -> ImageF32:
+    """Legacy entry — fixed scale=4, DC-preserving, patch region."""
+    return _bilateral_attack(
+        decoy_srgb, method, text_block,
+        scale=DEFAULT_SCALE, dc_preserving=True, region_px=region_px,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main generation entry point
 # ---------------------------------------------------------------------------
@@ -258,41 +404,88 @@ def generate_anamorpher_image(
     mode: str = "nearest",
     decoy_image: Optional[Image.Image] = None,
     resolution: int = 336,
+    *,
+    multiplier: int = DEFAULT_SCALE,
+    target_mode: str = "figstep",
+    dc_preserving: Optional[bool] = None,
+    steps: int = NUM_STEPS,
     region: Optional[Tuple[float, float, float, float]] = None,
+    # Back-compat — older notebook code passed `scale=` positionally / by name
+    scale: Optional[int] = None,
 ) -> Image.Image:
     """Generate an adversarial image.
 
-    The output resolution is `resolution * SCALE`. The hidden text is placed
-    in `region` (or a centered 80%x60% default). The rest of the image keeps
-    the decoy's pixels — the cover looks innocent until a 4:1 downscale.
+    The output image is `multiplier * resolution` per side. After a
+    vulnerable downscaler reduces by that factor, the VLM sees an image of
+    size `resolution × resolution` that approximates `target_mode`'s target.
 
     Args:
-        instructions : text to hide in the image
-        mode         : "nearest" | "bicubic" | "bilinear"
-        decoy_image  : decoy PIL image (resized internally). None => flat gray.
-        resolution   : preprocessor target resolution (336 default for LLaVA)
-        region       : (y, x, h, w) as fractions of `resolution`, or None
+        instructions  : text to embed in the post-downscale image
+        mode          : "nearest" | "bilinear" | "bicubic"
+        decoy_image   : decoy PIL image (resized internally). None => flat gray.
+        resolution    : post-downscale size (= VLM native image resolution)
+        multiplier    : full-res / downscaled ratio. 4 / 6 / 8 typical.
+        target_mode   : "figstep" (default, Ch1-style full-canvas) or "patch"
+        dc_preserving : (bilinear/bicubic only) keep the cover visually intact.
+                        Default None = True for "patch", False for "figstep"
+                        (the high-contrast typographic target needs amplitude
+                        the DC constraint can't deliver).
+        steps         : how many empty numbered items to append (figstep mode)
+        region        : (y, x, h, w) fractions, for "patch" mode only.
+        scale         : back-compat alias for `multiplier`.
     """
-    target_size = resolution
-    decoy_size = target_size * SCALE
+    if scale is not None:
+        multiplier = scale
+    s = int(multiplier)
+    if s not in (2, 3, 4, 5, 6, 7, 8):
+        raise ValueError(f"multiplier must be 2-8 (got {multiplier}). Typical: 4, 6, 8.")
+    if target_mode not in ("figstep", "patch"):
+        raise ValueError(f"target_mode must be 'figstep' or 'patch' (got {target_mode!r}).")
+
+    target_size = int(resolution)
+    decoy_size = target_size * s
 
     if decoy_image is None:
         decoy_img = Image.new("RGB", (decoy_size, decoy_size), (240, 240, 240))
     else:
         decoy_img = decoy_image.convert("RGB").resize((decoy_size, decoy_size), Image.LANCZOS)
 
+    # Build the (target_size × target_size) target image
+    if target_mode == "figstep":
+        target_img = render_figstep_target(instructions, target_size, steps=steps)
+    else:  # patch
+        py, px, ph, pw = _region_px(region, target_size)
+        decoy_down = decoy_img.resize((target_size, target_size), Image.NEAREST)
+        text_block = render_text_block(instructions, pw, ph)
+        decoy_down.paste(text_block, (px, py))
+        target_img = decoy_down
+
     if mode == "nearest":
-        target_img = _build_nearest_target(instructions, target_size, decoy_img, region)
         decoy_lin = srgb_to_linear(np.array(decoy_img, dtype=np.float32))
         target_lin = srgb_to_linear(np.array(target_img, dtype=np.float32))
-        adv_lin = _nearest_attack(decoy_lin, target_lin, lam=0.25, offset=2)
+        # lam=0 for full-canvas (clean reveal); legacy patch default lam=0.25.
+        lam = 0.0 if target_mode == "figstep" else 0.25
+        adv_lin = _nearest_attack(decoy_lin, target_lin, lam=lam, scale=s)
         adv_srgb = linear_to_srgb(adv_lin)
     elif mode in ("bicubic", "bilinear"):
         method = cv2.INTER_CUBIC if mode == "bicubic" else cv2.INTER_LINEAR
-        py, px, ph, pw = _region_px(region, target_size)
-        text_block = render_text_block(instructions, pw, ph)
+        # Default: drop DC-preserving for full-canvas FigStep so the contrast
+        # actually lands; keep it for the legacy patch demo.
+        dc = dc_preserving if dc_preserving is not None else (target_mode != "figstep")
         decoy_srgb = np.array(decoy_img, dtype=np.float32)
-        adv_srgb = _dc_preserving_attack(decoy_srgb, method, text_block, (py, px, ph, pw))
+        if target_mode == "patch":
+            py, px, ph, pw = _region_px(region, target_size)
+            text_block_full = render_text_block(instructions, pw, ph)
+            # The legacy path expects the text block at (pw, ph) sized
+            adv_srgb = _bilateral_attack(
+                decoy_srgb, method, text_block_full,
+                scale=s, dc_preserving=dc, region_px=(py, px, ph, pw),
+            )
+        else:  # figstep — pass the full-canvas target
+            adv_srgb = _bilateral_attack(
+                decoy_srgb, method, target_img,
+                scale=s, dc_preserving=dc, region_px=None,
+            )
     else:
         raise ValueError(f"Unknown mode {mode!r}. Use nearest|bicubic|bilinear.")
 

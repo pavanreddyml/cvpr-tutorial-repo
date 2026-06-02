@@ -20,13 +20,15 @@ from typing import Dict, List, Tuple
 
 from PIL import Image
 
-from .attacks import generate_anamorpher_image, SCALE
+from .attacks import generate_anamorpher_image, DEFAULT_SCALE
 
 
 def generate_multi_resolution_image(
     payloads: Dict[int, str],
     decoy_image: Image.Image,
     mode: str = "nearest",
+    multiplier: int = DEFAULT_SCALE,
+    target_mode: str = "figstep",
 ) -> Image.Image:
     """Generate a single image carrying different payloads per target resolution.
 
@@ -34,6 +36,8 @@ def generate_multi_resolution_image(
       payloads     : { target_resolution: hidden_text } e.g. {224: "...", 336: "...", 384: "..."}
       decoy_image  : the visible cover
       mode         : interpolation method to attack
+      multiplier   : full-res / downscaled ratio (must match across payloads)
+      target_mode  : "figstep" (Ch1 typographic) or "patch" (legacy)
     """
     if not payloads:
         raise ValueError("payloads must contain at least one (resolution, text) pair")
@@ -48,17 +52,21 @@ def generate_multi_resolution_image(
         mode=mode,
         decoy_image=decoy_image,
         resolution=largest,
+        multiplier=multiplier,
+        target_mode=target_mode,
     )
 
     # For each smaller target, build its own attack image at the SAME canvas
     # size (so layouts match) and paste only its centered text region over base.
-    base_w, base_h = base.size  # = largest * SCALE
+    base_w, base_h = base.size  # = largest * multiplier
     for tgt in targets[1:]:
         sub = generate_anamorpher_image(
             instructions=payloads[tgt],
             mode=mode,
             decoy_image=decoy_image,
             resolution=tgt,
+            multiplier=multiplier,
+            target_mode=target_mode,
         )
         # Resize sub up to base size, then paste only its centered 60% area —
         # so different scales blend with different dominance.
