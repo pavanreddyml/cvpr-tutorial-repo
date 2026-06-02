@@ -463,6 +463,11 @@ def render_defense_compare(
     clean_image: Optional[Image.Image] = None,
     adv_image: Optional[Image.Image] = None,
     extras_html: str = "",
+    # Optional: BEFORE-defense classifier predictions. When provided, each
+    # panel header reads `BEFORE: <pre> -> AFTER: <post>` so it's obvious
+    # at a glance whether the defense changed the prediction.
+    clean_label_before: Optional[str] = None,
+    adv_label_before: Optional[str] = None,
 ) -> str:
     badge_html = " ".join(
         f'<span style="background:{COLORS["panel"]}; padding:3px 10px; '
@@ -478,6 +483,39 @@ def render_defense_compare(
         return (f'<img src="data:image/png;base64,{b64}" '
                 f'style="border-radius:6px; border:1px solid {color}; margin-bottom:8px;">')
 
+    def _header(emoji: str, panel_label: str, color: str,
+                 label_before: Optional[str], label_after: str) -> str:
+        # Two modes:
+        #  - no `before` provided: just show `<emoji> PANEL — <label>` (old layout).
+        #  - `before` provided: show `<emoji> PANEL\nBEFORE: x → AFTER: y` so
+        #    the defense's effect is unambiguous.
+        if label_before is None:
+            return (f'<div style="font-size:10px; color:{color}; '
+                     f'text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;">'
+                     f'{emoji} {panel_label} — {_esc(label_after)}</div>')
+        changed = label_before.strip().lower() != label_after.strip().lower()
+        # Strike the pre-defense label; bold the post-defense label.
+        # If `before == after`, also show the arrow but with "unchanged" hint.
+        if changed:
+            arrow_color = COLORS['green'] if color == COLORS['green'] else COLORS['amber']
+            after_style = f'color:{color}; font-weight:700;'
+        else:
+            arrow_color = COLORS['muted']
+            after_style = f'color:{color}; font-weight:700;'
+        return (
+            f'<div style="font-size:10px; color:{color}; text-transform:uppercase; '
+            f'letter-spacing:0.5px; margin-bottom:8px;">{emoji} {panel_label}</div>'
+            f'<div style="font-size:11px; margin-bottom:10px; line-height:1.5;">'
+            f'<span style="color:{COLORS["muted"]}; text-decoration:line-through;">'
+            f'BEFORE: {_esc(label_before)}</span>'
+            f'<span style="color:{arrow_color}; margin:0 8px; font-weight:600;">→</span>'
+            f'<span style="{after_style}">AFTER: {_esc(label_after)}</span>'
+            f'</div>'
+        )
+
+    clean_header = _header('✅', 'CLEAN', clean_color, clean_label_before, clean_label)
+    adv_header = _header('⚠️', 'ADVERSARIAL', adv_color, adv_label_before, adv_label)
+
     inner = f"""
     <div style="display:flex; justify-content:space-between; align-items:center;
                 margin-bottom:8px; font-size:13px;">
@@ -490,16 +528,14 @@ def render_defense_compare(
     <div style="display:flex; gap:14px; align-items:stretch;">
       <div style="flex:1; background:{COLORS['panel']}; border-radius:8px; padding:12px;
                   border-left:4px solid {clean_color}; text-align:center;">
-        <div style="font-size:10px; color:{clean_color}; text-transform:uppercase;
-                    letter-spacing:0.5px; margin-bottom:6px;">✅ CLEAN — {_esc(clean_label)}</div>
+        {clean_header}
         {_img(clean_image, clean_color)}
         <div style="font-size:12px; background:{COLORS['bg']}; padding:8px; border-radius:4px;
                     white-space:pre-wrap; min-height:60px;">{_esc(clean_status)}</div>
       </div>
       <div style="flex:1; background:{COLORS['panel']}; border-radius:8px; padding:12px;
                   border-left:4px solid {adv_color}; text-align:center;">
-        <div style="font-size:10px; color:{adv_color}; text-transform:uppercase;
-                    letter-spacing:0.5px; margin-bottom:6px;">⚠️ ADVERSARIAL — {_esc(adv_label)}</div>
+        {adv_header}
         {_img(adv_image, adv_color)}
         <div style="font-size:12px; background:{COLORS['bg']}; padding:8px; border-radius:4px;
                     white-space:pre-wrap; min-height:60px;">{_esc(adv_status)}</div>
