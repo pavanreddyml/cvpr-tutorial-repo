@@ -449,6 +449,100 @@ def render_vlm_final(
     return _shell(inner, max_width=1100)
 
 
+def render_defense_three_panel(
+    *,
+    defense_name: str,
+    description: str,
+    badges: List[Tuple[str, str]],
+    # Column 1 — the truth
+    clean_image: Image.Image,
+    clean_response: str,
+    # Column 2 — adversarial, no defense
+    adv_image: Image.Image,
+    adv_response: str,
+    # Column 3 — adversarial AFTER the defense's image transformation
+    defended_image: Image.Image,
+    defended_response: str,
+    # Outcome (used to color column 3): True if the defense recovered the
+    # clean reading, False otherwise.
+    recovered: bool,
+    extras_html: str = "",
+) -> str:
+    """3-panel side-by-side: ORIGINAL | ATTACKED | DEFENDED-ATTACKED.
+
+    Each panel shows an image and the probe model's response on that image.
+    The narrative reads left-to-right:
+      panel 1 ("ORIGINAL"):  what the probe says on the CLEAN image      — the truth
+      panel 2 ("ATTACKED"):  what the probe says on the ADVERSARIAL      — the attack landed
+      panel 3 ("DEFENDED"):  what the probe says on the DEFENDED ADV     — did the defense help?
+
+    `recovered` drives panel 3's color: green if defense restored the clean
+    reading, red if the attack survives the defense.
+
+    Works uniformly for both classifier responses ("giant panda (43%)") and
+    VLM responses (full generated text) — `*_response` is just a string.
+    """
+    badge_html = " ".join(
+        f'<span style="background:{COLORS["panel"]}; padding:3px 10px; '
+        f'border-radius:4px; color:{COLORS["muted"]}; font-size:11px;">'
+        f'{_esc(k)}: <b style="color:{COLORS["amber"]};">{_esc(str(v))}</b></span>'
+        for k, v in badges
+    )
+
+    def _img(im: Image.Image, color: str) -> str:
+        b64 = _pil_to_b64(im, (220, 220))
+        return (f'<img src="data:image/png;base64,{b64}" '
+                f'style="border-radius:6px; border:2px solid {color}; '
+                f'margin-bottom:10px;">')
+
+    def _panel(emoji: str, label: str, sub_label: str, color: str,
+                image: Image.Image, response: str) -> str:
+        return f'''
+        <div style="flex:1; background:{COLORS['panel']}; border-radius:8px;
+                    padding:14px; border-top:4px solid {color}; text-align:center;
+                    min-width:0;">
+          <div style="font-size:11px; color:{color}; text-transform:uppercase;
+                      letter-spacing:0.6px; font-weight:700;
+                      margin-bottom:2px;">{emoji} {_esc(label)}</div>
+          <div style="font-size:10px; color:{COLORS['muted']};
+                      margin-bottom:10px;">{_esc(sub_label)}</div>
+          {_img(image, color)}
+          <div style="font-size:12px; background:{COLORS['bg']}; padding:10px;
+                      border-radius:4px; text-align:left;
+                      white-space:pre-wrap; min-height:80px; line-height:1.4;">
+            {_esc(response)}
+          </div>
+        </div>'''
+
+    col1 = _panel('✅', 'ORIGINAL', 'clean image, no attack',
+                   COLORS['green'], clean_image, clean_response)
+    col2 = _panel('☠️', 'ATTACKED', 'adversarial, no defense',
+                   COLORS['red'], adv_image, adv_response)
+    col3_color = COLORS['green'] if recovered else COLORS['red']
+    col3_sub = ('defense recovered the clean reading'
+                if recovered else 'defense did NOT recover')
+    col3 = _panel('🛡️', 'DEFENDED', col3_sub,
+                   col3_color, defended_image, defended_response)
+
+    inner = f"""
+    <div style="display:flex; justify-content:space-between; align-items:center;
+                margin-bottom:8px; font-size:13px;">
+      <span style="color:{COLORS['amber']}; font-weight:600;">🛡️ {_esc(defense_name)}</span>
+      <span>{badge_html}</span>
+    </div>
+    <div style="font-size:12px; color:{COLORS['muted']}; margin-bottom:14px;
+                line-height:1.4;">{_esc(description)}</div>
+
+    <div style="display:flex; gap:14px; align-items:stretch;">
+      {col1}
+      {col2}
+      {col3}
+    </div>
+    {extras_html}
+    """
+    return _shell(inner, max_width=1300)
+
+
 def render_defense_compare(
     *,
     defense_name: str,
